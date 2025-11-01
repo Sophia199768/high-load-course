@@ -35,6 +35,9 @@ class APIController(
      Так как у нас bucketMaxCapacity = rate, то поведение становится строго равномерным , то есть лимитер выдаёт запросы максимально стабильно, без резких всплесков. */
     private var rateLimiter = TokenBucketRateLimiter(11, 11, 1, TimeUnit.SECONDS)
     /*Для третьего кейса processingTimeMillis = 26000, bucketMaxCapacity = 11 req/s * 26 s = 286 допустимых запросов - взяли чуть поменьше 284.*/
+    /*Для второго кейса будем использовать private var rateLimiter = LeakingBucketRateLimiter(
+        11, Duration.ofSeconds(1), 30
+    )*/
     private val counter = Counter.builder("queries.amount").tag("name", "orders").register(registry)
     private val counterPayment = Counter.builder("queries.amount").tag("name", "payment").register(registry)
 
