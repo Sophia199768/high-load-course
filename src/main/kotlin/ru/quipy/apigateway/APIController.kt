@@ -8,10 +8,13 @@ import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.http.HttpStatus
 import org.springframework.http.ResponseEntity
 import org.springframework.web.bind.annotation.*
+import ru.quipy.common.utils.CompositeRateLimiter
+import ru.quipy.common.utils.LeakingBucketRateLimiter
 import ru.quipy.common.utils.TokenBucketRateLimiter
 
 import ru.quipy.orders.repository.OrderRepository
 import ru.quipy.payments.logic.OrderPayer
+import java.time.Duration
 import java.util.*
 import java.util.concurrent.TimeUnit
 
@@ -33,11 +36,24 @@ class APIController(
     /*Мы обратили внимание на график Amount of queries, и также прочитали конфигурации аккаунта, максимальная пропускная способность это 11 rps (rateLimitPerSec=11),
      поэтому мы ограничили rate до 11.
      Так как у нас bucketMaxCapacity = rate, то поведение становится строго равномерным , то есть лимитер выдаёт запросы максимально стабильно, без резких всплесков. */
-    private var rateLimiter = TokenBucketRateLimiter(11, 11, 1, TimeUnit.SECONDS)
+   // private var rateLimiter = TokenBucketRateLimiter(11, 11, 1, TimeUnit.SECONDS)
     /*Для третьего кейса processingTimeMillis = 26000, bucketMaxCapacity = 11 req/s * 26 s = 286 допустимых запросов - взяли чуть поменьше 284.*/
     /*Для второго кейса будем использовать private var rateLimiter = LeakingBucketRateLimiter(
         11, Duration.ofSeconds(1), 30
     )*/
+
+    // LeakyBucket для стабильного потока
+    // TokenBucket для общего бюджета на весь период
+    private var rateLimiter = CompositeRateLimiter(
+        LeakingBucketRateLimiter( 11,  Duration.ofSeconds(1), 11),
+        TokenBucketRateLimiter(
+            150,
+            150,
+            11,
+            TimeUnit.SECONDS
+        )
+    )
+
     private val counter = Counter.builder("queries.amount").tag("name", "orders").register(registry)
     private val counterPayment = Counter.builder("queries.amount").tag("name", "payment").register(registry)
 
@@ -85,7 +101,7 @@ class APIController(
         // Для третьего теста меняем на 700
         /* Используем timestamp, чтобы определить, через сколько миллисекунд нужно повторить запрос.
 Если поставить слишком большое значение: клиент ждёт дольше, чем реально нужно, не укладываемся по времени в 6 минут, поэтому сокращаем до 700 */
-        val timestamp = System.currentTimeMillis() + 950
+        val timestamp = System.currentTimeMillis() + 90
         /*По тесту токены добавляются каждую секунду (1000 мс). Установка Retry-After = 950 мс позволяет начать повторные попытки чуть раньше, чем появится новый токен. Сделано для снижения риска накопления очереди запросов.*/
         if (!rateLimiter.tick()) {
             return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS)
