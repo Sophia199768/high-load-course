@@ -57,7 +57,6 @@ class PaymentExternalSystemAdapterImpl(
             semaphoreToLimitParallelRequest.acquire()
             try {
                 logger.warn("[$accountName] Submitting payment request for payment $paymentId")
-                slidingWindowRateLimiter.tickBlocking()
 
                 val transactionId = UUID.randomUUID()
 
@@ -73,6 +72,7 @@ class PaymentExternalSystemAdapterImpl(
                 var success = false
                 // Максимум три попытки, чтобы не пытаться бесконечно решить не работающий запрос
                 while (attempt <= 3 && !success) {
+                    slidingWindowRateLimiter.tickBlocking()
                     try {
                         val request = Request.Builder().run {
                             url("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
