@@ -44,15 +44,21 @@ class APIController(
 
     // LeakyBucket для стабильного потока
     // TokenBucket для общего бюджета на весь период
+    // CompositeRateLimiter: AND логика - оба лимитера должны разрешить
     private var rateLimiter = CompositeRateLimiter(
-        LeakingBucketRateLimiter( 11,  Duration.ofSeconds(1), 11),
         TokenBucketRateLimiter(
-            150,
-            150,
             11,
+            11 * 15,       // 165 capacity — немного мягче
+            1,
             TimeUnit.SECONDS
+        ),
+        LeakingBucketRateLimiter(
+            11,
+            Duration.ofSeconds(1),
+            145             // уменьшили чуть для контроля очереди
         )
     )
+
 
     private val counter = Counter.builder("queries.amount").tag("name", "orders").register(registry)
     private val counterPayment = Counter.builder("queries.amount").tag("name", "payment").register(registry)
@@ -105,10 +111,9 @@ class APIController(
         /*По тесту токены добавляются каждую секунду (1000 мс). Установка Retry-After = 950 мс позволяет начать повторные попытки чуть раньше, чем появится новый токен. Сделано для снижения риска накопления очереди запросов.*/
         if (!rateLimiter.tick()) {
             return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS)
-                .header("Retry-After", timestamp.toString())
+                .header("Retry-After", "2")
                 .build()
         }
-
 
         val order = orderRepository.findById(orderId)?.let {
             orderRepository.save(it.copy(status = OrderStatus.PAYMENT_IN_PROGRESS))
