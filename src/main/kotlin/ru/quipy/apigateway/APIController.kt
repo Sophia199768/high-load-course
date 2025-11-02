@@ -42,20 +42,20 @@ class APIController(
         11, Duration.ofSeconds(1), 30
     )*/
 
+    // Для второго теста мы используем
     // LeakyBucket для стабильного потока
     // TokenBucket для общего бюджета на весь период
-    // CompositeRateLimiter: AND логика - оба лимитера должны разрешить
     private var rateLimiter = CompositeRateLimiter(
         TokenBucketRateLimiter(
-            11,
-            11 * 15,       // 165 capacity — немного мягче
-            1,
-            TimeUnit.SECONDS
+            10,
+            10 * 12,       // 120 capacity — чуть меньше, токены будут быстрее использоваться
+            900,           // каждые 900 мс добавлять 1 токен
+            TimeUnit.MILLISECONDS
         ),
         LeakingBucketRateLimiter(
-            11,
+            10,
             Duration.ofSeconds(1),
-            145             // уменьшили чуть для контроля очереди
+            120            // очередь чуть меньше
         )
     )
 
