@@ -46,12 +46,17 @@ class PaymentExternalSystemAdapterImpl(
     private val semaphoreToLimitParallelRequest = OngoingWindow(parallelRequests)
     private val slidingWindowRateLimiter =
         SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
+    // Тут мы рассчитываем задержку между попытками
+    // averageProcessingTime = 7, rateLimitPerSec = 10, external rate = 7
+    // requestAverageProcessingTime.toMillis().toDouble()) / 2.0 - среднее время обработки одного запроса (7000 мс = 7 секунд), взяли половину 3.5 секунды, чтобы не ждать слишком долго
+    // rateLimitPerSec / 7.0 - В зависимости от лимита запросов в секунду будем менять - если лимит высокий (rateLimitPerSec большой) - множитель растёт и тогда задержка увеличивается
+    private val retryAfterMillis: Long = (((requestAverageProcessingTime.toMillis().toDouble()) / 2.0) * (rateLimitPerSec / 7.0)).toLong()
+
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         try {
             semaphoreToLimitParallelRequest.acquire()
             try {
                 logger.warn("[$accountName] Submitting payment request for payment $paymentId")
-                slidingWindowRateLimiter.tickBlocking()
 
                 val transactionId = UUID.randomUUID()
 
@@ -63,19 +68,24 @@ class PaymentExternalSystemAdapterImpl(
 
                 logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
 
-                try {
-                    val request = Request.Builder().run {
-                        url("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
-                        post(emptyBody)
-                    }.build()
+                var attempt = 1
+                var success = false
+                // Максимум три попытки, чтобы не пытаться бесконечно решить не работающий запрос
+                while (attempt <= 3 && !success) {
+                    slidingWindowRateLimiter.tickBlocking()
+                    try {
+                        val request = Request.Builder().run {
+                            url("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
+                            post(emptyBody)
+                        }.build()
 
-                    client.newCall(request).execute().use { response ->
-                        val body = try {
-                            mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
-                        } catch (e: Exception) {
-                            logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.code}, reason: ${response.body?.string()}")
-                            ExternalSysResponse(transactionId.toString(), paymentId.toString(),false, e.message)
-                        }
+                        client.newCall(request).execute().use { response ->
+                            val body = try {
+                                mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
+                            } catch (e: Exception) {
+                                logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.code}, reason: ${response.body?.string()}")
+                                ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
+                            }
 
                         logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
 
@@ -85,24 +95,37 @@ class PaymentExternalSystemAdapterImpl(
                             it.logProcessing(body.result, now(), transactionId, reason = body.message)
                         }
                         counter.increment()
-                    }
-                } catch (e: Exception) {
-                    when (e) {
-                        is SocketTimeoutException -> {
-                            logger.error("[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId", e)
-                            paymentESService.update(paymentId) {
-                                it.logProcessing(false, now(), transactionId, reason = "Request timeout.")
+
+                            if (body.result) {
+                                success = true
+                            } else if (attempt < 3) {
+                                logger.warn("[$accountName] Retry #$attempt for payment $paymentId after ${retryAfterMillis}ms")
+                                Thread.sleep(retryAfterMillis)
                             }
                         }
+                    } catch (e: Exception) {
+                        when (e) {
+                            is SocketTimeoutException -> {
+                                logger.error("[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId", e)
+                                paymentESService.update(paymentId) {
+                                    it.logProcessing(false, now(), transactionId, reason = "Request timeout.")
+                                }
+                            }
 
-                        else -> {
-                            logger.error("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId", e)
+                            else -> {
+                                logger.error("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId", e)
 
-                            paymentESService.update(paymentId) {
-                                it.logProcessing(false, now(), transactionId, reason = e.message)
+                                paymentESService.update(paymentId) {
+                                    it.logProcessing(false, now(), transactionId, reason = e.message)
+                                }
                             }
                         }
+                        if (attempt < 3) {
+                            // Вот тут говорим через сколько повторить
+                            Thread.sleep(retryAfterMillis)
+                        }
                     }
+                    attempt++
                 }
             } finally {
                 semaphoreToLimitParallelRequest.release()
