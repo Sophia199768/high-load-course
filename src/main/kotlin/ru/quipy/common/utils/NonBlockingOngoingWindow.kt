@@ -2,6 +2,8 @@ package ru.quipy.common.utils
 
 import java.util.concurrent.Semaphore
 import java.util.concurrent.atomic.AtomicInteger
+import java.time.Duration
+import java.util.concurrent.TimeUnit
 
 class OngoingWindow(
     maxWinSize: Int
