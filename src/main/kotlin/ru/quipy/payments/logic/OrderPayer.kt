@@ -36,7 +36,7 @@ class OrderPayer(
         TimeUnit.SECONDS,
         LinkedBlockingQueue<Runnable>(linkedBlockingQueue),
         NamedThreadFactory("payment-submission-executor"),
-        RejectedExecutionHandler { _, _ -> throw TooManyException(System.currentTimeMillis() + 300)
+        RejectedExecutionHandler { _, _ -> throw RuntimeExeption(System.currentTimeMillis() + 300)
         }
     )
 
@@ -44,7 +44,7 @@ class OrderPayer(
         val createdAt = System.currentTimeMillis()
 
         if (paymentExecutor.queue.remainingCapacity() <= 2) {
-            throw TooManyException(createdAt + 300)
+            throw RuntimeExeption(createdAt + 300)
         }
 
         try {
@@ -58,10 +58,10 @@ class OrderPayer(
                 }
             }
         } catch (e: RejectedExecutionException) {
-            throw TooManyException(System.currentTimeMillis() + 400)
+            throw RuntimeExeption(System.currentTimeMillis() + 400)
         }
         return createdAt
     }
 }
 
-class TooManyException(val retryAfterMillis: Long) : RuntimeException()
+class RuntimeExeption(val retryAfterMillis: Long) : RuntimeException()
