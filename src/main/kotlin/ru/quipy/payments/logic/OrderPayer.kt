@@ -11,6 +11,7 @@ import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
 import java.util.*
 import java.util.concurrent.*
+import kotlin.RuntimeException
 
 @Service
 class OrderPayer(
@@ -36,7 +37,7 @@ class OrderPayer(
         TimeUnit.SECONDS,
         LinkedBlockingQueue<Runnable>(linkedBlockingQueue),
         NamedThreadFactory("payment-submission-executor"),
-        RejectedExecutionHandler { _, _ -> throw RuntimeExeption(System.currentTimeMillis() + 300)
+        RejectedExecutionHandler { _, _ -> throw RuntimeException()
         }
     )
 
@@ -44,7 +45,7 @@ class OrderPayer(
         val createdAt = System.currentTimeMillis()
 
         if (paymentExecutor.queue.remainingCapacity() <= 2) {
-            throw RuntimeExeption(createdAt + 300)
+            throw RuntimeException()
         }
 
         try {
@@ -58,10 +59,8 @@ class OrderPayer(
                 }
             }
         } catch (e: RejectedExecutionException) {
-            throw RuntimeExeption(System.currentTimeMillis() + 400)
+            throw RuntimeException()
         }
         return createdAt
     }
 }
-
-class RuntimeExeption(val retryAfterMillis: Long) : RuntimeException()

@@ -12,7 +12,6 @@ import ru.quipy.common.utils.TokenBucketRateLimiter
 
 import ru.quipy.orders.repository.OrderRepository
 import ru.quipy.payments.logic.OrderPayer
-import ru.quipy.payments.logic.RuntimeExeption
 import java.util.*
 import java.util.concurrent.TimeUnit
 
@@ -95,9 +94,9 @@ class APIController(
         return try {
             val createdAt = orderPayer.processPayment(orderId, order.price, paymentId, deadline)
             ResponseEntity.ok(PaymentSubmissionDto(createdAt, paymentId))
-        } catch (e: RuntimeExeption) {
+        } catch (e: RuntimeException) {
             ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS)
-                .header("Retry-After", e.retryAfterMillis.toString())
+                .header("Retry-After", System.currentTimeMillis() + 300.toString())
                 .build()
         }
     }
