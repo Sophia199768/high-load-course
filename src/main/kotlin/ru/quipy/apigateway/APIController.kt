@@ -29,7 +29,7 @@ class APIController(
 
     @Autowired
     private lateinit var orderPayer: OrderPayer
-    private var rateLimiter = TokenBucketRateLimiter(1100, 1100, 1, TimeUnit.SECONDS)
+    private var rateLimiter = TokenBucketRateLimiter(500, 500, 1, TimeUnit.SECONDS)
     private val counter = Counter.builder("queries.amount").tag("name", "orders").register(registry)
     private val counterPayment = Counter.builder("queries.amount").tag("name", "payment").register(registry)
 
