@@ -80,6 +80,7 @@ class PaymentExternalSystemAdapterImpl(
             maxRequests = parallelRequests
             maxRequestsPerHost = parallelRequests
         })
+        .protocols(listOf(Protocol.HTTP_2, Protocol.HTTP_1_1))
         .connectTimeout(Duration.ofSeconds(5))
         .writeTimeout(Duration.ofSeconds(10))
         .build()
