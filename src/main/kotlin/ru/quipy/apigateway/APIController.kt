@@ -96,7 +96,7 @@ class APIController(
             ResponseEntity.ok(PaymentSubmissionDto(createdAt, paymentId))
         } catch (e: RuntimeException) {
             ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS)
-                .header("Retry-After", System.currentTimeMillis() + 300.toString())
+                .header("Retry-After", (System.currentTimeMillis() + 300).toString())
                 .build()
         }
     }
