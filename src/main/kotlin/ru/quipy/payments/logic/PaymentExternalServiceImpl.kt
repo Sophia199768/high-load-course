@@ -98,6 +98,8 @@ class PaymentExternalSystemAdapterImpl(
         return sorted[indexes]
     }
 
+    private val maxAttemptAmount = 3
+    private val minTimeToMakeRequest = 60
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long): CompletableFuture<Void> {
         val resultFuture = CompletableFuture<Void>()
 
@@ -245,9 +247,10 @@ class PaymentExternalSystemAdapterImpl(
 
                     summary.record((now() - requestStartTime) / 1000.0)
 
+                    val timeToDeadline = deadline - now()
                     if (body.result) {
                         future.complete(null)
-                    } else if (attempt < 3 && deadline - now() > 60) {
+                    } else if (attempt < maxAttemptAmount && timeToDeadline > minTimeToMakeRequest) {
                         scheduleRetry(paymentId, amount, transactionId, deadline, attempt, future)
                     } else {
                         future.complete(null)
