@@ -203,8 +203,10 @@ class PaymentExternalSystemAdapterImpl(
         clientWithTimeout.newCall(request).enqueue(object : Callback {
             override fun onFailure(call: Call, e: IOException) {
                 val duration = now() - attemptStartTime
-                if (lastDurations.size >= 1000) lastDurations.pollFirst()
-                lastDurations.offerLast(duration)
+                if (!lastDurations.offerLast(duration)) {
+                    lastDurations.pollFirst()
+                    lastDurations.offerLast(duration)
+                }
 
                 if (e is SocketTimeoutException || e.cause is SocketTimeoutException) {
                     logger.error("[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId", e)
@@ -228,8 +230,10 @@ class PaymentExternalSystemAdapterImpl(
             override fun onResponse(call: Call, response: Response) {
                 response.use {
                     val duration = now() - attemptStartTime
-                    if (lastDurations.size >= 1000) lastDurations.pollFirst()
-                    lastDurations.offerLast(duration)
+                    if (!lastDurations.offerLast(duration)) {
+                        lastDurations.pollFirst()
+                        lastDurations.offerLast(duration)
+                    }
 
                     val body = try {
                         mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
