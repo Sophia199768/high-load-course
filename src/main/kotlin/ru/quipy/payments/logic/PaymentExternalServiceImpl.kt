@@ -112,7 +112,6 @@ class PaymentExternalSystemAdapterImpl(
             }
 
             logger.warn("[$accountName] Submitting payment request for payment $paymentId (deadline in ${timeUntilDeadline}ms, inflight: ${currentInflight.get()})")
-            slidingWindowRateLimiter.tickBlocking()
 
             semaphoreToLimitParallelRequest.acquire()
             currentInflight.incrementAndGet()
@@ -184,6 +183,8 @@ class PaymentExternalSystemAdapterImpl(
             retryCounter.increment()
             logger.info("[$accountName] Retry #$attempt for payment $paymentId")
         }
+
+        slidingWindowRateLimiter.tickBlocking()
 
         val requestStartTime = now()
         val attemptStartTime = now()
