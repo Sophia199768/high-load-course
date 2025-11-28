@@ -141,10 +141,11 @@ class PaymentExternalSystemAdapterImpl(
                 }
 
         } catch (e: Exception) {
-            currentInflight.decrementAndGet()
-            semaphoreToLimitParallelRequest.release()
             logger.error("[$accountName] Error initiating payment $paymentId", e)
             resultFuture.completeExceptionally(e)
+        } finally {
+            currentInflight.decrementAndGet()
+            semaphoreToLimitParallelRequest.release()
         }
 
         return resultFuture
