@@ -85,8 +85,7 @@ class PaymentExternalSystemAdapterImpl(
         .writeTimeout(Duration.ofSeconds(10))
         .build()
     private val semaphoreToLimitParallelRequest = OngoingWindow(parallelRequests)
-    private val slidingWindowRateLimiter =
-        SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
+    private val slidingWindowRateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
 
     private val lastDurations = LinkedBlockingDeque<Long>(1000)
 
@@ -166,9 +165,6 @@ class PaymentExternalSystemAdapterImpl(
         }
 
         val histP95 = quantile(0.95)
-        // Для кейса 9: среднее 10s, max 50s
-        // При 1000 RPS * 30s = 30,000 in-flight, но semaphore только 20,000
-        // Поэтому timeout должен быть еще короче для первых попыток
         val attemptTimeout = if (attempt == 1) {
             histP95.coerceAtLeast(15000L).coerceAtMost(25_000L).coerceAtMost(remaining - 100)
         } else {
@@ -292,8 +288,7 @@ class PaymentExternalSystemAdapterImpl(
         }
 
         CompletableFuture.delayedExecutor(actualSleep, TimeUnit.MILLISECONDS).execute {
-            performRequestWithRetryAsync(paymentId, amount, transactionId, deadline, attempt + 1)
-                .whenComplete { _, throwable ->
+            performRequestWithRetryAsync(paymentId, amount, transactionId, deadline, attempt + 1).whenComplete { _, throwable ->
                     if (throwable != null) {
                         parentFuture.completeExceptionally(throwable)
                     } else {
