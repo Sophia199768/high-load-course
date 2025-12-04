@@ -55,7 +55,7 @@ class OrderPayer(
                     logger.trace("Payment ${createdEvent.paymentId} for order $orderId created.")
                     paymentService.submitPaymentRequest(paymentId, amount, createdAt, deadline)
                 } catch (e: Exception) {
-                    logger.error("Error processing payment $paymentId for order $orderId", e)
+                    logger.error("Error with $paymentId", e)
                 }
             }
         } catch (e: RejectedExecutionException) {
