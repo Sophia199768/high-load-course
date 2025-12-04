@@ -110,8 +110,6 @@ class PaymentExternalSystemAdapterImpl(
                 return resultFuture
             }
 
-            logger.warn("[$accountName] Submitting payment request for payment $paymentId (deadline in ${timeUntilDeadline}ms, inflight: ${currentInflight.get()})")
-
             semaphoreToLimitParallelRequest.acquire()
             currentInflight.incrementAndGet()
 
@@ -205,12 +203,10 @@ class PaymentExternalSystemAdapterImpl(
                 }
 
                 if (e is SocketTimeoutException || e.cause is SocketTimeoutException) {
-                    logger.error("[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId", e)
                     paymentESService.update(paymentId) {
                         it.logProcessing(false, now(), null, reason = "Request timeout")
                     }
                 } else {
-                    logger.error("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId", e)
                     paymentESService.update(paymentId) {
                         it.logProcessing(false, now(), null, reason = e.message ?: "unknown")
                     }
