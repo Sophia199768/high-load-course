@@ -28,7 +28,6 @@ class APIController(
 
     @Autowired
     private lateinit var orderPayer: OrderPayer
-    private var rateLimiter = TokenBucketRateLimiter(4000, 4000, 1, TimeUnit.SECONDS)
     private val counter = Counter.builder("queries.amount").tag("name", "orders").register(registry)
     private val counterPayment = Counter.builder("queries.amount").tag("name", "payment").register(registry)
 
@@ -72,19 +71,6 @@ class APIController(
     @PostMapping("/orders/{orderId}/payment")
     fun payOrder(@PathVariable orderId: UUID, @RequestParam deadline: Long): ResponseEntity<PaymentSubmissionDto> {
         val paymentId = UUID.randomUUID()
-
-        // Для третьего теста меняем на 700
-        /* Используем timestamp, чтобы определить, через сколько миллисекунд нужно повторить запрос.
-Если поставить слишком большое значение: клиент ждёт дольше, чем реально нужно, не укладываемся по времени в 6 минут, поэтому сокращаем до 700 */
-        val timestamp = System.currentTimeMillis() + 700
-        /*По тесту токены добавляются каждую секунду (1000 мс). Установка Retry-After = 950 мс позволяет начать повторные попытки чуть раньше, чем появится новый токен. Сделано для снижения риска накопления очереди запросов.*/
-
-
-        if (!rateLimiter.tick()) {
-            return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS)
-                .header("Retry-After", timestamp.toString())
-                .build()
-        }
 
         val order = orderRepository.findById(orderId)?.let {
             orderRepository.save(it.copy(status = OrderStatus.PAYMENT_IN_PROGRESS))
