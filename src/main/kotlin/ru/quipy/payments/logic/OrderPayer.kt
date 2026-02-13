@@ -27,7 +27,7 @@ class OrderPayer(
     @Autowired
     private lateinit var paymentService: PaymentService
 
-    private val linkedBlockingQueue = 2_000
+    private val linkedBlockingQueue = 5_000
 
     private val paymentExecutor = ThreadPoolExecutor(
         250,
@@ -45,23 +45,35 @@ class OrderPayer(
     fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long {
         val createdAt = System.currentTimeMillis()
         val remainingMs = deadline - createdAt
-        if (remainingMs <= 200) {
+        if (remainingMs <= 300) {
             throw RuntimeException()
         }
 
         val queueSize = paymentExecutor.queue.size
-        val roughQueueDelayMs = (queueSize.toLong() * 1000L / paymentExecutor.maximumPoolSize.coerceAtLeast(1))
-        if (remainingMs <= roughQueueDelayMs + 250L) {
+        val activeThreads = paymentExecutor.activeCount
+        val estimatedQueueDelayMs = if (activeThreads > 0) {
+            (queueSize.toLong() * 50L)
+        } else {
+            0L
+        }
+
+        if (remainingMs < estimatedQueueDelayMs + 500L) {
             throw RuntimeException()
         }
 
-        if (paymentExecutor.queue.remainingCapacity() <= 10) {
+        if (queueSize > 1000 || paymentExecutor.queue.remainingCapacity() <= 10) {
             throw RuntimeException()
         }
 
         try {
             paymentExecutor.submit {
                 try {
+                    val remainingBeforeSubmit = deadline - System.currentTimeMillis()
+                    if (remainingBeforeSubmit <= 200) {
+                        logger.warn("Payment $paymentId skipped - deadline too close before submit ($remainingBeforeSubmit ms)")
+                        return@submit
+                    }
+
                     val createdEvent = paymentESService.create { it.create(paymentId, orderId, amount) }
                     logger.trace("Payment ${createdEvent.paymentId} for order $orderId created.")
                     paymentService.submitPaymentRequest(paymentId, amount, createdAt, deadline)

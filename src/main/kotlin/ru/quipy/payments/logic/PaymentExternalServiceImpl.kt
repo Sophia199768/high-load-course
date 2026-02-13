@@ -68,8 +68,8 @@ class PaymentExternalSystemAdapterImpl(
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
     private val virtualThreadExecutor = Executors.newVirtualThreadPerTaskExecutor()
-    private val minimumDeadlineBudgetMs = 200L
-    private val maxWindowAcquireWaitMs = 1_200L
+    private val minimumDeadlineBudgetMs = 100L
+    private val maxWindowAcquireWaitMs = 3_000L
 
     private val client = OkHttpClient.Builder()
         .connectionPool(ConnectionPool(
@@ -128,7 +128,7 @@ class PaymentExternalSystemAdapterImpl(
 
         when (semaphoreToLimitParallelRequest.putIntoWindow()) {
             is NonBlockingOngoingWindow.WindowResponse.Fail -> {
-                val retryDelayMs = minOf(15L + ThreadLocalRandom.current().nextLong(0, 10), timeUntilDeadline - minimumDeadlineBudgetMs)
+                val retryDelayMs = minOf(3L + ThreadLocalRandom.current().nextLong(0, 3), timeUntilDeadline - minimumDeadlineBudgetMs)
                 if (retryDelayMs <= 0L) {
                     resultFuture.complete(null)
                     return
@@ -310,7 +310,7 @@ class PaymentExternalSystemAdapterImpl(
         parentFuture: CompletableFuture<Void>
     ) {
         val remaining = deadline - now()
-        val delayMs = minOf(10L + ThreadLocalRandom.current().nextLong(0, 10), remaining - minimumDeadlineBudgetMs)
+        val delayMs = minOf(1L + ThreadLocalRandom.current().nextLong(0, 2), remaining - minimumDeadlineBudgetMs)
         if (delayMs <= 0L) {
             parentFuture.complete(null)
             return

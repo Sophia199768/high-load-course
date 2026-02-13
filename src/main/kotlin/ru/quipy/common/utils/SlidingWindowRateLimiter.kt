@@ -50,18 +50,28 @@ class SlidingWindowRateLimiter(
 
     private val releaseJob = rateLimiterScope.launch {
         while (true) {
-            val head = queue.peek()
-            val winStart = System.currentTimeMillis() - window.toMillis()
-            if (head == null) {
-                delay(1L)
-                continue
+            val now = System.currentTimeMillis()
+            val winStart = now - window.toMillis()
+
+            var released = 0
+            while (true) {
+                val head = queue.peek()
+                if (head == null) {
+                    delay(1L)
+                    break
+                }
+                if (head.timestamp > winStart) {
+                    val delayTime = (head.timestamp - winStart).coerceAtMost(10L)
+                    delay(delayTime)
+                    break
+                }
+                sum.addAndGet(-1)
+                queue.poll()
+                released++
+                if (released >= 100) {
+                    break
+                }
             }
-            if (head.timestamp > winStart) {
-                delay(head.timestamp - winStart)
-                continue
-            }
-            sum.addAndGet(-1)
-            queue.take()
         }
     }.invokeOnCompletion { th -> if (th != null) logger.error("Rate limiter release job completed", th) }
     companion object {
