@@ -27,7 +27,8 @@ class OrderPayer(
     @Autowired
     private lateinit var paymentService: PaymentService
 
-    private val linkedBlockingQueue = 10_000
+    private val linkedBlockingQueue = 2_000
+
     private val paymentExecutor = ThreadPoolExecutor(
         250,
         1000,
@@ -38,13 +39,23 @@ class OrderPayer(
         RejectedExecutionHandler { _, _ -> throw RuntimeException()
         }
     )
-    private val gauge = Gauge.builder("queue.size", paymentExecutor.queue) { queue -> queue.size.toDouble() }
+    private val queueSizeGauge = Gauge.builder("queue.size", paymentExecutor.queue) { it.size.toDouble() }
         .register(registry)
 
     fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long {
         val createdAt = System.currentTimeMillis()
+        val remainingMs = deadline - createdAt
+        if (remainingMs <= 200) {
+            throw RuntimeException()
+        }
 
-        if (paymentExecutor.queue.remainingCapacity() <= 0) {
+        val queueSize = paymentExecutor.queue.size
+        val roughQueueDelayMs = (queueSize.toLong() * 1000L / paymentExecutor.maximumPoolSize.coerceAtLeast(1))
+        if (remainingMs <= roughQueueDelayMs + 250L) {
+            throw RuntimeException()
+        }
+
+        if (paymentExecutor.queue.remainingCapacity() <= 10) {
             throw RuntimeException()
         }
 

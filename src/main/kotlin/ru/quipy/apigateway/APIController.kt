@@ -2,9 +2,11 @@ package ru.quipy.apigateway
 
 import io.micrometer.core.instrument.Counter
 import io.micrometer.core.instrument.MeterRegistry
+import jakarta.annotation.PostConstruct
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
+import org.springframework.beans.factory.annotation.Value
 import org.springframework.http.HttpStatus
 import org.springframework.http.ResponseEntity
 import org.springframework.web.bind.annotation.*
@@ -28,8 +30,21 @@ class APIController(
 
     @Autowired
     private lateinit var orderPayer: OrderPayer
+    @Value("\${api.payment-rate-limit-per-sec:5000}")
+    private var paymentRateLimitPerSec: Int = 5000
+    private lateinit var rateLimiter: TokenBucketRateLimiter
     private val counter = Counter.builder("queries.amount").tag("name", "orders").register(registry)
     private val counterPayment = Counter.builder("queries.amount").tag("name", "payment").register(registry)
+
+    @PostConstruct
+    fun initRateLimiter() {
+        rateLimiter = TokenBucketRateLimiter(
+            paymentRateLimitPerSec,
+            paymentRateLimitPerSec,
+            1,
+            TimeUnit.SECONDS
+        )
+    }
 
     @PostMapping("/users")
     fun createUser(@RequestBody req: CreateUserRequest): User {
@@ -71,6 +86,13 @@ class APIController(
     @PostMapping("/orders/{orderId}/payment")
     fun payOrder(@PathVariable orderId: UUID, @RequestParam deadline: Long): ResponseEntity<PaymentSubmissionDto> {
         val paymentId = UUID.randomUUID()
+
+        val timestamp = System.currentTimeMillis() + 700
+        if (!rateLimiter.tick()) {
+            return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS)
+                .header("Retry-After", timestamp.toString())
+                .build()
+        }
 
         val order = orderRepository.findById(orderId)?.let {
             orderRepository.save(it.copy(status = OrderStatus.PAYMENT_IN_PROGRESS))
