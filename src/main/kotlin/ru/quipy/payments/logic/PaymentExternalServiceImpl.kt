@@ -55,18 +55,19 @@ class PaymentExternalSystemAdapterImpl(
         .tag("account", accountName)
         .register(registry)
 
-    private val inflightGauge = Gauge
-        .builder("inflight_requests", this) { adapter ->
-            adapter.currentInflight.get().toDouble()
-        }
-        .tag("account", accountName)
-        .register(registry)
-
     private val currentInflight = AtomicInteger(0)
 
-    private val requestAverageProcessingTime = properties.averageProcessingTime
-    private val rateLimitPerSec = properties.rateLimitPerSec
+    private val inflightGauge = Gauge
+        .builder("inflight_requests", this) {
+            it.currentInflight.get().toDouble()
+        }.tag("account", properties.accountName).register(registry)
+
     private val parallelRequests = properties.parallelRequests
+    private val rateLimitPerSec = properties.rateLimitPerSec
+    private val windowRetryBackoffMs = 1L
+    private val rateLimiterRetryBackoffMs = 0L
+    private val requestRetryBackoffMs = 0L
+
     private val virtualThreadExecutor = Executors.newVirtualThreadPerTaskExecutor()
     private val minimumDeadlineBudgetMs = 100L
     private val maxWindowAcquireWaitMs = 3_000L
@@ -83,26 +84,22 @@ class PaymentExternalSystemAdapterImpl(
         })
         .protocols(listOf(Protocol.HTTP_2, Protocol.HTTP_1_1))
         .connectTimeout(Duration.ofSeconds(5))
-        .writeTimeout(Duration.ofSeconds(10))
         .build()
     private val semaphoreToLimitParallelRequest = NonBlockingOngoingWindow(parallelRequests)
     private val slidingWindowRateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
+    @Volatile
+    private var emaLatency = properties.averageProcessingTime.toMillis().coerceAtLeast(500L)
 
-    private val lastDurations = LinkedBlockingDeque<Long>(1000)
-
-    private fun quantile(q: Double): Long {
-        val copy = lastDurations.toList()
-        if (copy.isEmpty()) return requestAverageProcessingTime.toMillis().coerceAtLeast(500L)
-        val sorted = copy.sorted()
-        val indexes = ((sorted.size - 1) * q).toInt().coerceIn(0, sorted.size - 1)
-        return sorted[indexes]
+    private fun updateLatency(duration: Long) {
+        val alpha = 0.2
+        emaLatency = (alpha * duration + (1 - alpha) * emaLatency).toLong()
     }
 
     private val maxAttemptAmount = 3
     private val minTimeToMakeRequest = 60
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long): CompletableFuture<Void> {
         val resultFuture = CompletableFuture<Void>()
-        tryAcquireSlotAndSubmit(paymentId, amount, paymentStartedAt, deadline, resultFuture, now())
+        tryAcquireSlotAndSubmit(paymentId, amount, paymentStartedAt, deadline, resultFuture)
         return resultFuture
     }
 
@@ -111,8 +108,7 @@ class PaymentExternalSystemAdapterImpl(
         amount: Int,
         paymentStartedAt: Long,
         deadline: Long,
-        resultFuture: CompletableFuture<Void>,
-        slotAcquireStartedAt: Long
+        resultFuture: CompletableFuture<Void>
     ) {
         val timeUntilDeadline = deadline - now()
         if (timeUntilDeadline <= minimumDeadlineBudgetMs) {
@@ -121,55 +117,35 @@ class PaymentExternalSystemAdapterImpl(
             return
         }
 
-        if (now() - slotAcquireStartedAt > maxWindowAcquireWaitMs) {
-            resultFuture.complete(null)
-            return
-        }
-
         when (semaphoreToLimitParallelRequest.putIntoWindow()) {
             is NonBlockingOngoingWindow.WindowResponse.Fail -> {
-                val retryDelayMs = minOf(3L + ThreadLocalRandom.current().nextLong(0, 3), timeUntilDeadline - minimumDeadlineBudgetMs)
-                if (retryDelayMs <= 0L) {
-                    resultFuture.complete(null)
-                    return
-                }
-
-                CompletableFuture.delayedExecutor(retryDelayMs, TimeUnit.MILLISECONDS).execute {
-                    tryAcquireSlotAndSubmit(paymentId, amount, paymentStartedAt, deadline, resultFuture, slotAcquireStartedAt)
-                }
+                CompletableFuture.delayedExecutor(windowRetryBackoffMs, TimeUnit.MILLISECONDS).execute {
+                    tryAcquireSlotAndSubmit(paymentId, amount, paymentStartedAt, deadline, resultFuture) }
             }
 
             is NonBlockingOngoingWindow.WindowResponse.Success -> {
                 currentInflight.incrementAndGet()
                 val transactionId = UUID.randomUUID()
 
-                try {
-                    // Вне зависимости от исхода оплаты важно отметить что она была отправлена.
-                    // Это требуется сделать ВО ВСЕХ СЛУЧАЯХ, поскольку эта информация используется сервисом тестирования.
-                    paymentESService.update(paymentId) {
-                        it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
-                    }
-
-                    logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
-
-                    performRequestWithRetryAsync(paymentId, amount, transactionId, deadline, 1)
-                        .whenComplete { _, throwable ->
-                            currentInflight.decrementAndGet()
-                            semaphoreToLimitParallelRequest.releaseWindow()
-
-                            if (throwable != null) {
-                                logger.error("[$accountName] Async payment processing failed for payment $paymentId", throwable)
-                                resultFuture.completeExceptionally(throwable)
-                            } else {
-                                resultFuture.complete(null)
-                            }
-                        }
-                } catch (e: Exception) {
-                    currentInflight.decrementAndGet()
-                    semaphoreToLimitParallelRequest.releaseWindow()
-                    logger.error("[$accountName] Error initiating payment $paymentId", e)
-                    resultFuture.completeExceptionally(e)
+                // Вне зависимости от исхода оплаты важно отметить что она была отправлена.
+                // Это требуется сделать ВО ВСЕХ СЛУЧАЯХ, поскольку эта информация используется сервисом тестирования.
+                paymentESService.update(paymentId) {
+                    it.logSubmission(true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
                 }
+
+                logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
+
+
+                performRequestWithRetryAsync(paymentId, amount, transactionId, deadline, 1)
+                    .whenComplete { _, throwable ->
+                        currentInflight.decrementAndGet()
+                        semaphoreToLimitParallelRequest.releaseWindow()
+
+                        if (throwable != null)
+                            resultFuture.completeExceptionally(throwable)
+                        else
+                            resultFuture.complete(null)
+                    }
             }
         }
     }
@@ -189,84 +165,56 @@ class PaymentExternalSystemAdapterImpl(
             return future
         }
 
-        val histP95 = quantile(0.95)
-        val minExpected = requestAverageProcessingTime.toMillis().coerceAtLeast(500L)
-        val attemptTimeout = if (attempt == 1) {
-            histP95.coerceAtLeast(minExpected * 2).coerceAtMost(10_000L).coerceAtMost(remaining - 100)
-        } else {
-            histP95.coerceAtLeast(minExpected * 3).coerceAtMost(15_000L).coerceAtMost(remaining - 100)
-        }
-        if (attemptTimeout <= 0L) {
-            future.complete(null)
-            return future
-        }
-
-        if (attempt > 1) {
-            retryCounter.increment()
-            logger.info("[$accountName] Retry #$attempt for payment $paymentId")
-        }
-
-        if (deadline - now() <= minimumDeadlineBudgetMs) {
-            future.complete(null)
-            return future
-        }
-
         if (!slidingWindowRateLimiter.tick()) {
-            scheduleRateLimiterRetry(paymentId, amount, transactionId, deadline, attempt, future)
+            CompletableFuture.delayedExecutor(rateLimiterRetryBackoffMs, TimeUnit.MILLISECONDS)
+                .execute {
+                    performRequestWithRetryAsync(paymentId, amount, transactionId, deadline, attempt)
+                        .whenComplete { _, _ -> future.complete(null) }
+                }
             return future
         }
 
-        if (deadline - now() <= minimumDeadlineBudgetMs) {
-            future.complete(null)
-            return future
-        }
+        val timeout = emaLatency.coerceAtLeast(800).coerceAtMost(10_000)
 
-        val requestStartTime = now()
-        val attemptStartTime = now()
-
-
-        val clientWithTimeout = client.newBuilder()
-            .callTimeout(Duration.ofMillis(attemptTimeout))
-            .readTimeout(Duration.ofMillis(attemptTimeout))
+        val request = Request.Builder()
+            .url("http://$paymentProviderHostPort/external/process" +
+                    "?serviceName=${properties.serviceName}" +
+                    "&token=$token" +
+                    "&accountName=${properties.accountName}" +
+                    "&transactionId=$transactionId" +
+                    "&paymentId=$paymentId" +
+                    "&amount=$amount")
+            .post(emptyBody)
             .build()
 
-        val request = Request.Builder().run {
-            url("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
-            post(emptyBody)
-        }.build()
+        val call = client.newCall(request)
+        call.timeout().timeout(timeout, TimeUnit.MILLISECONDS)
 
-        clientWithTimeout.newCall(request).enqueue(object : Callback {
+        val requestStart = now()
+
+        call.enqueue(object : Callback {
+
             override fun onFailure(call: Call, e: IOException) {
-                val duration = now() - attemptStartTime
-                if (!lastDurations.offerLast(duration)) {
-                    lastDurations.pollFirst()
-                    lastDurations.offerLast(duration)
-                }
-
-                if (e is SocketTimeoutException || e.cause is SocketTimeoutException) {
-                    paymentESService.update(paymentId) {
-                        it.logProcessing(false, now(), null, reason = "Request timeout")
-                    }
-                } else {
-                    paymentESService.update(paymentId) {
-                        it.logProcessing(false, now(), null, reason = e.message ?: "unknown")
-                    }
-                }
+                updateLatency(now() - requestStart)
 
                 if (attempt < maxAttemptAmount && deadline - now() > minTimeToMakeRequest) {
-                    scheduleRetry(paymentId, amount, transactionId, deadline, attempt, future)
+                    retryCounter.increment()
+                    CompletableFuture.delayedExecutor(requestRetryBackoffMs, TimeUnit.MILLISECONDS)
+                        .execute {
+                            performRequestWithRetryAsync(paymentId, amount, transactionId, deadline, attempt + 1)
+                                .whenComplete { _, _ -> future.complete(null) }
+                        }
                 } else {
+                    paymentESService.update(paymentId) {
+                        it.logProcessing(false, now(), transactionId, reason = e.message ?: "error")
+                    }
                     future.complete(null)
                 }
             }
 
             override fun onResponse(call: Call, response: Response) {
                 response.use {
-                    val duration = now() - attemptStartTime
-                    if (!lastDurations.offerLast(duration)) {
-                        lastDurations.pollFirst()
-                        lastDurations.offerLast(duration)
-                    }
+                    updateLatency(now() - requestStart)
 
                     val body = try {
                         mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
@@ -275,91 +223,29 @@ class PaymentExternalSystemAdapterImpl(
                         ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
                     }
 
-                    logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
-
-                    // Здесь мы обновляем состояние оплаты в зависимости от результата в базе данных оплат.
-                    // Это требуется сделать ВО ВСЕХ ИСХОДАХ (успешная оплата / неуспешная / ошибочная ситуация)
-                    paymentESService.update(paymentId) {
-                        it.logProcessing(body.result, now(), transactionId, reason = body.message)
-                    }
+                    summary.record((now() - requestStart) / 1000.0)
                     counter.increment()
 
-                    summary.record((now() - requestStartTime) / 1000.0)
-
-                    val timeToDeadline = deadline - now()
-                    if (body.result) {
+                    if (body.result || attempt >= maxAttemptAmount) {
+                        // Здесь мы обновляем состояние оплаты в зависимости от результата в базе данных оплат.
+                        // Это требуется сделать ВО ВСЕХ ИСХОДАХ (успешная оплата / неуспешная / ошибочная ситуация)
+                        paymentESService.update(paymentId) {
+                            it.logProcessing(body.result, now(), transactionId, reason = body.message)
+                        }
                         future.complete(null)
-                    } else if (attempt < maxAttemptAmount && timeToDeadline > minTimeToMakeRequest) {
-                        scheduleRetry(paymentId, amount, transactionId, deadline, attempt, future)
                     } else {
-                        future.complete(null)
+                        retryCounter.increment()
+                        CompletableFuture.delayedExecutor(requestRetryBackoffMs, TimeUnit.MILLISECONDS)
+                            .execute {
+                                performRequestWithRetryAsync(paymentId, amount, transactionId, deadline, attempt + 1)
+                                    .whenComplete { _, _ -> future.complete(null) }
+                            }
                     }
                 }
             }
         })
 
         return future
-    }
-
-    private fun scheduleRateLimiterRetry(
-        paymentId: UUID,
-        amount: Int,
-        transactionId: UUID,
-        deadline: Long,
-        attempt: Int,
-        parentFuture: CompletableFuture<Void>
-    ) {
-        val remaining = deadline - now()
-        val delayMs = minOf(1L + ThreadLocalRandom.current().nextLong(0, 2), remaining - minimumDeadlineBudgetMs)
-        if (delayMs <= 0L) {
-            parentFuture.complete(null)
-            return
-        }
-
-        CompletableFuture.delayedExecutor(delayMs, TimeUnit.MILLISECONDS).execute {
-            performRequestWithRetryAsync(paymentId, amount, transactionId, deadline, attempt)
-                .whenComplete { _, throwable ->
-                    if (throwable != null) {
-                        parentFuture.completeExceptionally(throwable)
-                    } else {
-                        parentFuture.complete(null)
-                    }
-                }
-        }
-    }
-
-    private fun scheduleRetry(
-        paymentId: UUID,
-        amount: Int,
-        transactionId: UUID,
-        deadline: Long,
-        attempt: Int,
-        parentFuture: CompletableFuture<Void>
-    ) {
-        val adder = ThreadLocalRandom.current().nextLong(0, 100)
-        val backoff = (200L * (1L shl (attempt - 1))).coerceAtMost(2000L)
-        val beforeDeadline = deadline - now()
-
-        if (beforeDeadline <= minTimeToMakeRequest) {
-            parentFuture.complete(null)
-            return
-        }
-
-        val actualSleep = minOf(backoff + adder, beforeDeadline - minTimeToMakeRequest)
-        if (actualSleep <= 0) {
-            parentFuture.complete(null)
-            return
-        }
-
-        CompletableFuture.delayedExecutor(actualSleep, TimeUnit.MILLISECONDS).execute {
-            performRequestWithRetryAsync(paymentId, amount, transactionId, deadline, attempt + 1).whenComplete { _, throwable ->
-                if (throwable != null) {
-                    parentFuture.completeExceptionally(throwable)
-                } else {
-                    parentFuture.complete(null)
-                }
-            }
-        }
     }
 
     override fun price() = properties.price
