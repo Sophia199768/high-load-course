@@ -69,7 +69,10 @@ class PaymentExternalSystemAdapterImpl(
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val windowRetryBackoffMs = 1L
     private val retryScheduler: ScheduledExecutorService =
-        Executors.newScheduledThreadPool((Runtime.getRuntime().availableProcessors() * 2).coerceIn(8, 32))
+        Executors.newScheduledThreadPool(
+            1,
+            Thread.ofVirtual().factory()
+        )
 
     private val virtualThreadExecutor = Executors.newVirtualThreadPerTaskExecutor()
     private val minimumDeadlineBudgetMs = 30L
