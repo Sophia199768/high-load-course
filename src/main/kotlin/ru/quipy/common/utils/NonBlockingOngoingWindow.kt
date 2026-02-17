@@ -2,8 +2,6 @@ package ru.quipy.common.utils
 
 import java.util.concurrent.Semaphore
 import java.util.concurrent.atomic.AtomicInteger
-import java.time.Duration
-import java.util.concurrent.TimeUnit
 
 class OngoingWindow(
     maxWinSize: Int
@@ -22,23 +20,28 @@ class OngoingWindow(
 class NonBlockingOngoingWindow(
     private val maxWinSize: Int
 ) {
-    private val winSize = AtomicInteger()
+    private val permits = Semaphore(maxWinSize, false)
+    private val winSize = AtomicInteger(0)
 
     fun putIntoWindow(): WindowResponse {
-        while (true) {
-            val currentWinSize = winSize.get()
-            if (currentWinSize >= maxWinSize) {
-                return WindowResponse.Fail(currentWinSize)
-            }
-
-            if (winSize.compareAndSet(currentWinSize, currentWinSize + 1)) {
-                break
-            }
+        if (!permits.tryAcquire()) {
+            return WindowResponse.Fail(winSize.get())
         }
-        return WindowResponse.Success(winSize.get())
+        return WindowResponse.Success(winSize.incrementAndGet())
     }
 
-    fun releaseWindow() = winSize.decrementAndGet()
+    fun releaseWindow(): Int {
+        while (true) {
+            val current = winSize.get()
+            if (current <= 0) {
+                return 0
+            }
+            if (winSize.compareAndSet(current, current - 1)) {
+                permits.release()
+                return current - 1
+            }
+        }
+    }
 
 
     sealed class WindowResponse(val currentWinSize: Int) {

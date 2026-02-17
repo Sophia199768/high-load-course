@@ -30,6 +30,8 @@ class APIController(
 
     @Autowired
     private lateinit var orderPayer: OrderPayer
+    @Value("\${api.payment-rate-limit-enabled:true}")
+    private var paymentRateLimitEnabled: Boolean = true
     @Value("\${api.payment-rate-limit-per-sec:5000}")
     private var paymentRateLimitPerSec: Int = 5000
     private lateinit var rateLimiter: TokenBucketRateLimiter
@@ -88,7 +90,7 @@ class APIController(
         val paymentId = UUID.randomUUID()
 
         val timestamp = System.currentTimeMillis() + 700
-        if (!rateLimiter.tick()) {
+        if (paymentRateLimitEnabled && !rateLimiter.tick()) {
             return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS)
                 .header("Retry-After", timestamp.toString())
                 .build()

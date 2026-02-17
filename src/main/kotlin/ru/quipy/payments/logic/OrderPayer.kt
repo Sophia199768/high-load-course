@@ -36,8 +36,7 @@ class OrderPayer(
         TimeUnit.SECONDS,
         LinkedBlockingQueue<Runnable>(linkedBlockingQueue),
         NamedThreadFactory("payment-submission-executor"),
-        RejectedExecutionHandler { _, _ -> throw RuntimeException()
-        }
+        ThreadPoolExecutor.AbortPolicy()
     )
     private val queueSizeGauge = Gauge.builder("queue.size", paymentExecutor.queue) { it.size.toDouble() }
         .register(registry)
@@ -66,12 +65,12 @@ class OrderPayer(
         }
 
         try {
-            paymentExecutor.submit {
+            paymentExecutor.execute {
                 try {
                     val remainingBeforeSubmit = deadline - System.currentTimeMillis()
                     if (remainingBeforeSubmit <= 200) {
                         logger.warn("Payment $paymentId skipped - deadline too close before submit ($remainingBeforeSubmit ms)")
-                        return@submit
+                        return@execute
                     }
 
                     val createdEvent = paymentESService.create { it.create(paymentId, orderId, amount) }
