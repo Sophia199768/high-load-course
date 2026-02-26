@@ -22,6 +22,7 @@ import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.ThreadLocalRandom
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 
 // Advice: always treat time as a Duration
@@ -62,10 +63,10 @@ class PaymentExternalSystemAdapterImpl(
             it.currentInflight.get().toDouble()
         }.tag("account", properties.accountName).register(registry)
 
-    private val parallelRequests = properties.parallelRequests.coerceIn(5_000, 6_000)
+    private val parallelRequests = properties.parallelRequests
     private val dispatcherMaxRequests = parallelRequests
     private val dispatcherMaxRequestsPerHost = parallelRequests
-    private val connectionPoolMaxIdleConnections = parallelRequests.coerceIn(512, 4_096)
+    private val connectionPoolMaxIdleConnections = parallelRequests
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val windowRetryBackoffMs = 1L
     private val retryScheduler: ScheduledExecutorService =
@@ -79,6 +80,8 @@ class PaymentExternalSystemAdapterImpl(
     private val readTimeout = Duration.ofSeconds(10)
     private val minAdaptiveTimeoutMs = 10L
     private val maxAdaptiveTimeoutMs = 2_000L
+    private val hedgeDelayMs: Long
+        get() = (emaLatency * 1.5).toLong().coerceIn(50L, 800L)
 
     private val client = OkHttpClient.Builder()
         .connectionPool(ConnectionPool(
@@ -158,7 +161,7 @@ class PaymentExternalSystemAdapterImpl(
                 logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
 
 
-                performRequestWithRetryAsync(paymentId, amount, transactionId, deadline, 1)
+                performRequestWithHedgingAsync(paymentId, amount, transactionId, deadline, 1)
                     .whenComplete { _, throwable ->
                         currentInflight.decrementAndGet()
                         semaphoreToLimitParallelRequest.releaseWindow()
@@ -172,7 +175,7 @@ class PaymentExternalSystemAdapterImpl(
         }
     }
 
-    private fun performRequestWithRetryAsync(
+    private fun performRequestWithHedgingAsync(
         paymentId: UUID,
         amount: Int,
         transactionId: UUID,
@@ -193,13 +196,30 @@ class PaymentExternalSystemAdapterImpl(
                     if (deadline - now() <= minimumDeadlineBudgetMs) {
                         future.complete(null)
                     } else {
-                        performRequestWithRetryAsync(paymentId, amount, transactionId, deadline, attempt)
+                        performRequestWithHedgingAsync(paymentId, amount, transactionId, deadline, attempt)
                             .whenComplete { _, _ -> future.complete(null) }
                     }
                 }
             return future
         }
 
+        val done = AtomicBoolean(false)
+        buildAndEnqueue(paymentId, amount, transactionId, deadline, attempt, future, done)
+        val hedgeTask = retryScheduler.schedule({
+            if (done.get()) return@schedule
+            if (deadline - now() <= minimumDeadlineBudgetMs) return@schedule
+
+            logger.debug("[$accountName] Hedge sent for $paymentId, txId: $transactionId")
+
+            buildAndEnqueue(paymentId, amount, transactionId, deadline, attempt, future, done)
+        }, hedgeDelayMs, TimeUnit.MILLISECONDS)
+
+        future.whenComplete { _, _ -> hedgeTask.cancel(false) }
+
+        return future
+    }
+
+    private fun buildAndEnqueue(paymentId: UUID, amount: Int, transactionId: UUID, deadline: Long, attempt: Int, future: CompletableFuture<Void>, done: AtomicBoolean): Call {
         val timeoutByLatency = emaLatency.coerceAtLeast(minAdaptiveTimeoutMs).coerceAtMost(maxAdaptiveTimeoutMs)
         val timeoutByDeadline = (deadline - now() - minimumDeadlineBudgetMs).coerceAtLeast(minAdaptiveTimeoutMs)
         val timeout = minOf(timeoutByLatency, timeoutByDeadline)
@@ -212,6 +232,7 @@ class PaymentExternalSystemAdapterImpl(
                     "&transactionId=$transactionId" +
                     "&paymentId=$paymentId" +
                     "&amount=$amount")
+            .header("x-idempotency-key", transactionId.toString())
             .post(emptyBody)
             .build()
 
@@ -226,21 +247,25 @@ class PaymentExternalSystemAdapterImpl(
                 val failureAt = now()
                 updateLatency(failureAt - requestStart)
 
+                if (done.get()) return
                 if (attempt < maxAttemptAmount && deadline - failureAt > minTimeToMakeRequest) {
-                    retryCounter.increment()
-                    retryScheduler.schedule(
-                        {
-                            performRequestWithRetryAsync(paymentId, amount, transactionId, deadline, attempt + 1)
+                    if (done.compareAndSet(false, true)) {
+                        retryCounter.increment()
+                        retryScheduler.schedule({
+                            performRequestWithHedgingAsync(paymentId, amount, transactionId, deadline, attempt + 1)
                                 .whenComplete { _, _ -> future.complete(null) }
                         },
-                        requestRetryDelayMs(attempt),
-                        TimeUnit.MILLISECONDS
-                    )
-                } else {
-                    paymentESService.update(paymentId) {
-                        it.logProcessing(false, failureAt, transactionId, reason = e.message ?: "error")
+                            requestRetryDelayMs(attempt),
+                            TimeUnit.MILLISECONDS
+                        )
                     }
-                    future.complete(null)
+                } else {
+                    if (done.compareAndSet(false, true)) {
+                        paymentESService.update(paymentId) {
+                            it.logProcessing(false, failureAt, transactionId, reason = e.message ?: "error")
+                        }
+                        future.complete(null)
+                    }
                 }
             }
 
@@ -264,29 +289,39 @@ class PaymentExternalSystemAdapterImpl(
                     summary.record((responseAt - requestStart) / 1000.0)
                     counter.increment()
 
-                    if (body.result || attempt >= maxAttemptAmount) {
+                    if (body.result) {
                         // Здесь мы обновляем состояние оплаты в зависимости от результата в базе данных оплат.
                         // Это требуется сделать ВО ВСЕХ ИСХОДАХ (успешная оплата / неуспешная / ошибочная ситуация)
-                        paymentESService.update(paymentId) {
-                            it.logProcessing(body.result, responseAt, transactionId, reason = body.message)
+                        if (done.compareAndSet(false, true)) {
+                            paymentESService.update(paymentId) {
+                                it.logProcessing(true, responseAt, transactionId, reason = body.message)
+                            }
+                            future.complete(null)
                         }
-                        future.complete(null)
                     } else {
-                        retryCounter.increment()
-                        retryScheduler.schedule(
-                            {
-                                performRequestWithRetryAsync(paymentId, amount, transactionId, deadline, attempt + 1)
-                                    .whenComplete { _, _ -> future.complete(null) }
-                            },
-                            requestRetryDelayMs(attempt),
-                            TimeUnit.MILLISECONDS
-                        )
+                        if (attempt >= maxAttemptAmount) {
+                            if (done.compareAndSet(false, true)) {
+                                paymentESService.update(paymentId) {
+                                    it.logProcessing(false, responseAt, transactionId, reason = body.message)
+                                }
+                                future.complete(null)
+                            }
+                        } else {
+                            if (done.compareAndSet(false, true)) {
+                                retryCounter.increment()
+                                retryScheduler.schedule({
+                                    performRequestWithHedgingAsync(
+                                        paymentId, amount, transactionId, deadline, attempt + 1
+                                    ).whenComplete { _, _ -> future.complete(null) }
+                                }, requestRetryDelayMs(attempt), TimeUnit.MILLISECONDS)
+                            }
+                        }
                     }
                 }
             }
         })
 
-        return future
+        return call
     }
 
     override fun price() = properties.price
