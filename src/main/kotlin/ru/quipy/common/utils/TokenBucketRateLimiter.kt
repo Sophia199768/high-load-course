@@ -1,14 +1,6 @@
 package ru.quipy.common.utils
 
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.asCoroutineDispatcher
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.launch
-import org.slf4j.Logger
-import org.slf4j.LoggerFactory
-import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicInteger
 
 class TokenBucketRateLimiter(
     private val rate: Int,
@@ -16,38 +8,31 @@ class TokenBucketRateLimiter(
     private val window: Long,
     private val timeUnit: TimeUnit = TimeUnit.MINUTES,
 ): RateLimiter {
-    companion object {
-        private val logger: Logger = LoggerFactory.getLogger(TokenBucketRateLimiter::class.java)
-    }
-
-    private val rateLimiterScope = CoroutineScope(Executors.newSingleThreadExecutor().asCoroutineDispatcher())
-
-    private var bucket: AtomicInteger = AtomicInteger(0)
-    private var start = System.currentTimeMillis()
-    private var nextExpectedWakeUp = start + timeUnit.toMillis(window)
-
-    private val releaseJob = rateLimiterScope.launch {
-        while (true) {
-            start = System.currentTimeMillis()
-            nextExpectedWakeUp = start + timeUnit.toMillis(window)
-
-            bucket.get().let { cur ->
-                bucket.addAndGet(if (cur + rate > bucketMaxCapacity) bucketMaxCapacity - cur else rate)
-            }
-            delay(nextExpectedWakeUp - System.currentTimeMillis())
-        }
-    }.invokeOnCompletion { th -> if (th != null) logger.error("Rate limiter release job completed", th) }
+    private val capacity = bucketMaxCapacity.coerceAtLeast(1)
+    private val refillRatePerNano = rate.toDouble() / timeUnit.toNanos(window.coerceAtLeast(1L)).toDouble()
+    private var availableTokens = capacity.toDouble()
+    private var lastRefillNanos = System.nanoTime()
 
     override fun tick(): Boolean {
-        while (true) {
-            val tokensAvailable = bucket.get()
-            if (tokensAvailable <= 0) {
+        if (rate <= 0) {
+            return false
+        }
+        synchronized(this) {
+            refill()
+            if (availableTokens < 1.0) {
                 return false
             }
-            val res = bucket.compareAndSet(tokensAvailable, tokensAvailable - 1)
-            if (res) {
-                return true
-            }
+            availableTokens -= 1.0
+            return true
+        }
+    }
+
+    private fun refill() {
+        val now = System.nanoTime()
+        val elapsed = (now - lastRefillNanos).coerceAtLeast(0L)
+        if (elapsed > 0L) {
+            availableTokens = (availableTokens + elapsed * refillRatePerNano).coerceAtMost(capacity.toDouble())
+            lastRefillNanos = now
         }
     }
 }
