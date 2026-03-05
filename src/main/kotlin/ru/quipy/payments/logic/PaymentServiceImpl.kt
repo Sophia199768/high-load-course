@@ -17,30 +17,13 @@ import kotlin.concurrent.withLock
 class PaymentSystemImpl(
     private val paymentAccounts: List<PaymentExternalSystemAdapter>
 ) : PaymentService {
-
     companion object {
         val logger = LoggerFactory.getLogger(PaymentSystemImpl::class.java)
     }
 
-    override fun submitPaymentRequest(
-        paymentId: UUID,
-        amount: Int,
-        paymentStartedAt: Long,
-        deadline: Long
-    ) {
-        paymentAccounts.forEach { account ->
-            Thread.startVirtualThread {
-                try {
-                    account.performPaymentAsync(
-                        paymentId,
-                        amount,
-                        paymentStartedAt,
-                        deadline
-                    )
-                } catch (e: Exception) {
-                    logger.error("Error in account for payment $paymentId", e)
-                }
-            }
+    override fun submitPaymentRequest(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
+        for (account in paymentAccounts) {
+            account.performPaymentAsync(paymentId, amount, paymentStartedAt, deadline)
         }
     }
 }
