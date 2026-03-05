@@ -169,22 +169,28 @@ class PaymentExternalSystemAdapterImpl(
 
             while (!slidingWindowRateLimiter.tick()) {
                 if (deadline - now() <= minimumDeadlineBudgetMs) return
-                Thread.sleep(1)
+                slidingWindowRateLimiter.tickAsync().get()
+                if (deadline - now() <= minimumDeadlineBudgetMs) return
             }
 
             val remaining = deadline - now()
             if (remaining <= minimumDeadlineBudgetMs) return
 
             val resultFuture = CompletableFuture<Pair<Boolean, String?>>()
+            buildAndEnqueue(paymentId, amount, transactionId, deadline, resultFuture)
 
             val hedgeTask = retryScheduler.schedule({
                 if (!resultFuture.isDone) {
-                    logger.debug("[$accountName] Hedge sent for $paymentId, txId: $transactionId")
                     buildAndEnqueue(paymentId, amount, transactionId, deadline, resultFuture)
                 }
             }, hedgeDelayMs, TimeUnit.MILLISECONDS)
 
-            val (success, message) = resultFuture.get()
+            val timeoutMs = (deadline - now() - minimumDeadlineBudgetMs).coerceAtLeast(1L)
+            val (success, message) = try {
+                resultFuture.get(timeoutMs, TimeUnit.MILLISECONDS)
+            } catch (e: Exception) {
+                Pair(false, e.message ?: "timeout")
+            }
             hedgeTask.cancel(false)
 
             if (success) {
