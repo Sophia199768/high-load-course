@@ -2,6 +2,9 @@ package ru.quipy.payments.logic
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
+import io.github.resilience4j.circuitbreaker.CircuitBreaker
+import io.github.resilience4j.circuitbreaker.CircuitBreakerConfig
+import io.github.resilience4j.circuitbreaker.CircuitBreakerConfig.SlidingWindowType
 import io.micrometer.core.instrument.Counter
 import io.micrometer.core.instrument.DistributionSummary
 import io.micrometer.core.instrument.Gauge
@@ -56,6 +59,11 @@ class PaymentExternalSystemAdapterImpl(
         .tag("account", accountName)
         .register(registry)
 
+    private val callNotPermittedCounter = Counter
+        .builder("payment_circuit_breaker_rejected_total")
+        .tag("account", accountName)
+        .register(registry)
+
     private val currentInflight = AtomicInteger(0)
 
     private val inflightGauge = Gauge
@@ -80,8 +88,7 @@ class PaymentExternalSystemAdapterImpl(
     private val readTimeout = Duration.ofSeconds(10)
     private val minAdaptiveTimeoutMs = 10L
     private val maxAdaptiveTimeoutMs = 2_000L
-    private val hedgeDelayMs: Long
-        get() = (emaLatency * 1.5).toLong().coerceIn(50L, 800L)
+    private val hedgeDelayMs = 150L
 
     private val client = OkHttpClient.Builder()
         .connectionPool(ConnectionPool(
@@ -99,6 +106,34 @@ class PaymentExternalSystemAdapterImpl(
         .build()
     private val semaphoreToLimitParallelRequest = NonBlockingOngoingWindow(parallelRequests)
     private val slidingWindowRateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
+    private val circuitBreaker = CircuitBreaker.of(
+        "payment:$accountName",
+        CircuitBreakerConfig.custom()
+            .slidingWindowType(SlidingWindowType.TIME_BASED)
+            .slidingWindowSize(10)
+            .minimumNumberOfCalls(1000)
+            .failureRateThreshold(70f)
+            .slowCallRateThreshold(80f)
+            .slowCallDurationThreshold(Duration.ofSeconds(5))
+            .waitDurationInOpenState(Duration.ofSeconds(5))
+            .permittedNumberOfCallsInHalfOpenState(5)
+            .automaticTransitionFromOpenToHalfOpenEnabled(true)
+            .recordException { it is ExternalServiceException }
+            .build()
+    )
+    private val circuitBreakerStateGauge = Gauge
+        .builder("payment_circuit_breaker_state", circuitBreaker) { cb ->
+            when (cb.state) {
+                CircuitBreaker.State.CLOSED -> 0.0
+                CircuitBreaker.State.OPEN -> 1.0
+                CircuitBreaker.State.HALF_OPEN -> 2.0
+                CircuitBreaker.State.DISABLED -> 3.0
+                CircuitBreaker.State.FORCED_OPEN -> 4.0
+                CircuitBreaker.State.METRICS_ONLY -> 5.0
+            }
+        }
+        .tag("account", accountName)
+        .register(registry)
     @Volatile
     private var emaLatency = properties.averageProcessingTime.toMillis().coerceAtLeast(minAdaptiveTimeoutMs)
 
@@ -115,6 +150,14 @@ class PaymentExternalSystemAdapterImpl(
         val jitter = ThreadLocalRandom.current().nextLong(0, 15)
         return (expBackoff + jitter).coerceAtMost(500L)
     }
+
+    init {
+        circuitBreaker.eventPublisher
+            .onStateTransition { event ->
+                logger.info("[$accountName] CircuitBreaker transition: ${event.stateTransition}")
+            }
+    }
+
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long): CompletableFuture<Void> {
         val resultFuture = CompletableFuture<Void>()
 
@@ -207,12 +250,29 @@ class PaymentExternalSystemAdapterImpl(
                 return
             }
 
+            if (message == "rejected by circuit breaker") {
+                paymentESService.update(paymentId) {
+                    it.logProcessing(false, now(), transactionId, reason = message)
+                }
+                return
+            }
+
             retryCounter.increment()
             Thread.sleep(requestRetryDelayMs(attempt))
         }
     }
 
-    private fun buildAndEnqueue(paymentId: UUID, amount: Int, transactionId: UUID, deadline: Long, resultFuture: CompletableFuture<Pair<Boolean, String?>>): Call {
+    private fun buildAndEnqueue(paymentId: UUID, amount: Int, transactionId: UUID, deadline: Long, resultFuture: CompletableFuture<Pair<Boolean, String?>>) {
+        if (!circuitBreaker.tryAcquirePermission()) {
+            callNotPermittedCounter.increment()
+            val state = circuitBreaker.state
+            if (state == CircuitBreaker.State.OPEN) {
+                logger.debug("[$accountName] CircuitBreaker OPEN, payment $paymentId rejected")
+            }
+            resultFuture.complete(Pair(false, "rejected by circuit breaker"))
+            return
+        }
+
         val timeoutByLatency = emaLatency.coerceAtLeast(minAdaptiveTimeoutMs).coerceAtMost(maxAdaptiveTimeoutMs)
         val timeoutByDeadline = (deadline - now() - minimumDeadlineBudgetMs).coerceAtLeast(minAdaptiveTimeoutMs)
         val timeout = minOf(timeoutByLatency, timeoutByDeadline)
@@ -238,29 +298,55 @@ class PaymentExternalSystemAdapterImpl(
 
             override fun onFailure(call: Call, e: IOException) {
                 val failureAt = now()
-                updateLatency(failureAt - requestStart)
+                val callDuration = failureAt - requestStart
+                updateLatency(callDuration)
+                circuitBreaker.onError(callDuration, TimeUnit.MILLISECONDS, ExternalServiceException("I/O error", e))
                 resultFuture.complete(Pair(false, e.message ?: "error"))
             }
 
             override fun onResponse(call: Call, response: Response) {
                 response.use {
                     val responseAt = now()
-                    updateLatency(responseAt - requestStart)
+                    val callDuration = responseAt - requestStart
+                    updateLatency(callDuration)
                     val rawBody = response.body?.string()
 
-                    val body = if (rawBody.isNullOrBlank()) {
-                        ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, "empty body")
-                    } else {
-                        try {
-                            mapper.readValue(rawBody, ExternalSysResponse::class.java)
-                        } catch (e: Exception) {
-                            logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.code}, reason: $rawBody")
-                            ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
-                        }
+                    if (!response.isSuccessful) {
+                        circuitBreaker.onError(
+                            callDuration,
+                            TimeUnit.MILLISECONDS,
+                            ExternalServiceException("HTTP ${response.code}")
+                        )
+                        resultFuture.complete(Pair(false, "http ${response.code}"))
+                        return
                     }
 
-                    summary.record((responseAt - requestStart) / 1000.0)
+                    if (rawBody.isNullOrBlank()) {
+                        circuitBreaker.onError(
+                            callDuration,
+                            TimeUnit.MILLISECONDS,
+                            ExternalServiceException("empty response body")
+                        )
+                        resultFuture.complete(Pair(false, "empty body"))
+                        return
+                    }
+
+                    val body = try {
+                        mapper.readValue(rawBody, ExternalSysResponse::class.java)
+                    } catch (e: Exception) {
+                        circuitBreaker.onError(
+                            callDuration,
+                            TimeUnit.MILLISECONDS,
+                            ExternalServiceException("invalid response body", e)
+                        )
+                        logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.code}, reason: $rawBody")
+                        resultFuture.complete(Pair(false, e.message ?: "invalid response body"))
+                        return
+                    }
+
+                    summary.record(callDuration / 1000.0)
                     counter.increment()
+                    circuitBreaker.onSuccess(callDuration, TimeUnit.MILLISECONDS)
 
                     if (body.result) {
                         resultFuture.complete(Pair(true, body.message))
@@ -270,8 +356,6 @@ class PaymentExternalSystemAdapterImpl(
                 }
             }
         })
-
-        return call
     }
 
     override fun price() = properties.price
@@ -283,3 +367,5 @@ class PaymentExternalSystemAdapterImpl(
 }
 
 public fun now() = System.currentTimeMillis()
+
+private class ExternalServiceException(message: String, cause: Throwable? = null) : RuntimeException(message, cause)
