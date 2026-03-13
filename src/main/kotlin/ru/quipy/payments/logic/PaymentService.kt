@@ -25,6 +25,7 @@ interface PaymentExternalSystemAdapter {
     fun price(): Int
 
     fun isEnabled(): Boolean
+    fun isAvailable(): Boolean
 }
 
 /**
