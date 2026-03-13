@@ -255,7 +255,6 @@ class PaymentExternalSystemAdapterImpl(
 
     private fun buildAndEnqueue(paymentId: UUID, amount: Int, transactionId: UUID, deadline: Long, resultFuture: CompletableFuture<Pair<Boolean, String?>>) {
         if (!circuitBreaker.tryAcquirePermission()) {
-            callNotPermittedCounter.increment()
             val state = circuitBreaker.state
             if (state == CircuitBreaker.State.OPEN) {
                 logger.debug("[$accountName] CircuitBreaker OPEN, payment $paymentId rejected")
