@@ -16,7 +16,7 @@ class PaymentSystemImpl(
         val account = checkAccount()
 
         if (account == null) {
-            logger.warn("No available account for payment $paymentId — all circuit breakers OPEN or no time left")
+            logger.warn("No available account for payment")
             return
         }
 
