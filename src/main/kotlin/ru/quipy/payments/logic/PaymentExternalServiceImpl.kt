@@ -63,11 +63,6 @@ class PaymentExternalSystemAdapterImpl(
         .tag("account", accountName)
         .register(registry)
 
-    private val callNotPermittedCounter = Counter
-        .builder("payment_circuit_breaker_rejected_total")
-        .tag("account", accountName)
-        .register(registry)
-
     private val currentInflight = AtomicInteger(0)
 
     private val inflightGauge = Gauge
