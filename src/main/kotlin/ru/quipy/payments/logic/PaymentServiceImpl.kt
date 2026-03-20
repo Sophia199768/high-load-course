@@ -1,46 +1,36 @@
 package ru.quipy.payments.logic
 
 import org.slf4j.LoggerFactory
-import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.stereotype.Service
-import ru.quipy.common.utils.NamedThreadFactory
-import ru.quipy.core.EventSourcingService
-import ru.quipy.payments.api.PaymentAggregate
-import java.time.Duration
 import java.util.*
-import java.util.concurrent.Executors
-import java.util.concurrent.locks.ReentrantLock
-import kotlin.concurrent.withLock
-
 
 @Service
 class PaymentSystemImpl(
     private val paymentAccounts: List<PaymentExternalSystemAdapter>
 ) : PaymentService {
-
     companion object {
         val logger = LoggerFactory.getLogger(PaymentSystemImpl::class.java)
     }
 
-    override fun submitPaymentRequest(
-        paymentId: UUID,
-        amount: Int,
-        paymentStartedAt: Long,
-        deadline: Long
-    ) {
-        paymentAccounts.forEach { account ->
-            Thread.startVirtualThread {
-                try {
-                    account.performPaymentAsync(
-                        paymentId,
-                        amount,
-                        paymentStartedAt,
-                        deadline
-                    )
-                } catch (e: Exception) {
-                    logger.error("Error in account for payment $paymentId", e)
-                }
-            }
+    override fun submitPaymentRequest(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
+        val account = checkAccount()
+
+        if (account == null) {
+            logger.warn("No available account for payment")
+            return
+        }
+
+        account.performPaymentAsync(paymentId, amount, paymentStartedAt, deadline)
+    }
+
+    private fun checkAccount(): PaymentExternalSystemAdapter? {
+        val account = paymentAccounts.firstOrNull { it.isEnabled() } ?: return null
+
+        return if (account.isAvailable()) {
+            account
+        } else {
+            logger.warn("Circuit breaker OPEN")
+            account
         }
     }
 }
